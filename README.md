@@ -1,52 +1,62 @@
 # feishu-mod
 
-在飞书 / Lark 里和 Claude Code 对话：给机器人发的私聊消息会作为一轮提问送进你电脑上正在运行的 Claude Code 会话，回答自动回复到原消息下。
+Chat with Claude Code from Feishu / Lark. Direct messages sent to your bot are submitted as a turn in the Claude Code session running on your machine, and the answer is posted back as a reply to the original message.
 
-A Claude Code mod (function-hooks plugin) that bridges a Feishu/Lark bot to your local Claude Code session using [lark-cli](https://github.com/larksuite/cli).
+It is a Claude Code mod (a function-hooks plugin) built on [lark-cli](https://github.com/larksuite/cli).
 
-## 安装
+## Install
 
-在 Claude Code 终端会话里输入：
+In a Claude Code terminal session:
 
 ```
 /plugin install feishu-mod --marketplace Jianyuuuuu/claude-code-feishu-mod
 ```
 
-提示 `Add marketplace?` 时按 `y`，然后选择安装范围（默认 user）。
+Answer `y` to `Add marketplace?`, then pick a scope (user is the default).
 
-## 准备飞书机器人
+## Set up the Feishu bot
 
-1. 安装 lark-cli：`npm i -g @larksuite/cli`
-2. 新建一个专用应用并存为 `claude-code` profile（会给出登录链接 / 二维码）：
+1. Install lark-cli: `npm i -g @larksuite/cli`
+2. Create a dedicated app and save it as the `claude-code` profile (it prints a sign-in link and QR code):
 
    ```
    lark-cli config init --new --name claude-code
    ```
 
-3. 在开放平台确认：开启机器人能力；事件订阅选「长连接」并添加 `im.message.receive_v1`；权限 `im:message`、`im:message.p2p_msg:readonly`、`im:message:send_as_bot`、`im:message.reactions:write_only`；发布版本。
+3. In the Feishu / Lark developer console:
+   - enable the **Bot** capability;
+   - under event subscriptions, choose **long connection (WebSocket)** and add `im.message.receive_v1`;
+   - grant the scopes `im:message`, `im:message.p2p_msg:readonly`, `im:message:send_as_bot` and `im:message.reactions:write_only`;
+   - publish a version whose availability includes you.
 
-> 建议用一个专用应用。同一个 app 被多个长连接客户端订阅时，事件只会随机投递给其中一个。
+> Use a dedicated app. When several long-connection clients subscribe to the same app, each event is delivered to only one of them at random.
 
-## 使用
+## Usage
 
-| 命令 | 作用 |
+| Command | What it does |
 | --- | --- |
-| `/feishu on` | 在当前会话开始接收飞书消息（状态栏显示「飞书 ● 在线」） |
-| `/feishu off` | 停止 |
-| `/feishu status` | 状态、授权用户、最近一个未授权发送者 |
-| `/feishu allow last` | 授权最近一个未授权的发送者（也可写 `ou_xxx`） |
-| `/feishu deny ou_xxx` | 移除授权 |
+| `/feishu on` | Start receiving Feishu messages in this session (the status line shows `飞书 ● 在线`) |
+| `/feishu off` | Stop |
+| `/feishu status` | Connection state, allowed users, and the last unknown sender |
+| `/feishu allow last` | Allow the most recent unknown sender (or pass an `ou_…` open_id) |
+| `/feishu deny ou_xxx` | Remove a user from the allow list |
 
-首次使用：`/feishu on` → 在飞书私聊机器人发一句 → `/feishu allow last` → 再发消息即可。
+First run: `/feishu on`, send the bot a direct message, run `/feishu allow last`, then message it again.
 
-## 工作原理
+## How it works
 
-- 会话里后台运行 `lark-cli --profile claude-code event consume im.message.receive_v1 --as bot`，逐行读取 NDJSON 事件，断线 5 秒后自动重连。
-- 授权用户的消息按 `message_id` 去重，加 `OnIt` 表情，并以 `$.prompt.submit` 作为一轮提问提交（会话忙时自动排队）。
-- `turn.complete` 时把最终回答通过 `lark-cli im +messages-reply --markdown` 回复原消息（超长自动分段、带幂等键），成功后加 `DONE` 表情。
-- 白名单为空时不处理任何消息。每个会话默认关闭，需要手动 `/feishu on`，避免多个会话重复回复。
+- The session runs `lark-cli --profile claude-code event consume im.message.receive_v1 --as bot` in the background, reading NDJSON events line by line. If the process exits, it reconnects after 5 seconds.
+- Messages from allowed users are de-duplicated by `message_id`, get an `OnIt` reaction, and are submitted with `$.prompt.submit`. If the session is busy, they wait in the queue.
+- On `turn.complete`, the final answer is sent with `lark-cli im +messages-reply --markdown` as a reply to the original message. Long answers are split into chunks, each with an idempotency key. A `DONE` reaction follows once the reply is sent.
+- No message is handled while the allow list is empty. The bridge is off by default in every session, so that several open sessions don't all answer the same message.
 
-## 开发
+## Limitations
+
+- The Claude Code session must stay open; replies come from that session.
+- Only the text of a message is relayed. Images and files appear as placeholders.
+- Replies are written in Simplified Chinese by default, set by the reply guide in `hooks/lib.ts`.
+
+## Development
 
 ```
 claude plugin validate .
