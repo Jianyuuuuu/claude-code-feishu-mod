@@ -1,6 +1,6 @@
 {
   "name": "feishu-mod",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Chat with Claude Code from Feishu/Lark: two-way chat, images, permission and question cards, slash commands — via lark-cli",
   "author": { "name": "Zheng Jianyu", "email": "jianyuuuuu@gmail.com" },
   "repository": "https://github.com/Jianyuuuuu/claude-code-feishu-mod",

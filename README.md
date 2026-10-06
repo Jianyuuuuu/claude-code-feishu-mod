@@ -10,7 +10,10 @@ This is a Claude Code mod (a function-hooks plugin) built on [lark-cli](https://
 - **Images and files.** Images, files and images inside rich-text posts are downloaded to `/tmp/feishu-mod/<message_id>/`, and Claude reads them from there. If an answer mentions a local image by its absolute path, that image is sent back.
 - **Permission cards.** When Claude needs approval, the local dialog opens as usual and a Feishu card is sent at the same time, with **Allow once / Don't ask again this session / Deny**. You can answer in either place. The first answer wins, and the other side is updated.
 - **Question forms.** `AskUserQuestion` (single choice, multiple choice, or free text) is sent as a Feishu form card at the same time as the local dialog.
-- **Slash commands from Feishu.** Send `/compact`, `/doctor`, a skill name, and so on. `/cost`, `/usage`, `/context` and `/stats` are answered from the session's own figures, so no panel opens at the computer.
+- **Slash commands from Feishu.** Send `/compact`, `/doctor`, a skill name, and so on. Commands that would open a panel at the computer are adapted for Feishu instead:
+  - `/config` and `/model` open a live settings card. Toggles become buttons and choices become selects; each click applies immediately and the card redraws.
+  - `/cost`, `/usage`, `/context`, `/stats`, `/status` and `/help` are answered as text.
+  - Panels that only work at the computer (`/resume`, `/mcp`, `/login`, `/theme`, …) are not run; Feishu is told to use the computer.
 - **Status badges.** Incoming messages get a `Typing` reaction while Claude works on them. It is removed when the reply is sent, and `CrossMark` marks a failure.
 
 ## Install
@@ -66,7 +69,7 @@ First run: `/feishu on`, send the bot a direct message, run `/feishu allow last`
 ## Limitations
 
 - The Claude Code session must stay open; replies come from that session.
-- Commands that open an interactive panel (`/model`, `/config`, `/resume`, …) open it at the computer. After 30 seconds without output, Feishu is told to look there.
+- Any other command that opens an interactive panel opens it at the computer. After 30 seconds without output, Feishu is told to look there.
 - Cards go to the last direct chat with the bot. Group chats are relayed, but they are not used for cards.
 - Replies default to Simplified Chinese; the reply guide in `hooks/lib.ts` sets this.
 

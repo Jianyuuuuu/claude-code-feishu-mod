@@ -6,11 +6,13 @@ import {
   answersFromForm,
   answersMarkdown,
   approvalCard,
+  configCard,
   questionCard,
   resolvedCard,
   type ApprovalChoice,
   type AskQuestion,
   type Card,
+  type ConfigRowView,
 } from './cards'
 import {
   buildPrompt,
@@ -186,7 +188,11 @@ async function waitCardAction($: $, id: string, seconds: number): Promise<Record
       debug($, `card wait failed: ${String(err)}`)
       return null
     })
-    if (!res) return null
+    // A failing consume would spin: give up and leave the answer to the computer.
+    if (!res || res.exitCode !== 0) {
+      if (res) debug($, `card wait exited ${res.exitCode}: ${res.stderr.slice(0, 300)}`)
+      return null
+    }
     const line = res.stdout.split('\n').find(l => l.trim().startsWith('{'))
     const ev = line ? parseObject(line) : null
     if (!ev) continue
@@ -249,6 +255,70 @@ async function usageText($: $, command: string): Promise<string> {
 }
 
 const USAGE_COMMANDS = new Set(['cost', 'usage', 'context', 'stats'])
+/** Panels that only make sense at the computer: not run from Feishu at all. */
+const LOCAL_ONLY = new Set([
+  'resume', 'mcp', 'agents', 'plugin', 'plugins', 'permissions', 'hooks', 'memory', 'login', 'logout',
+  'theme', 'ide', 'rewind', 'tasks', 'bashes', 'export', 'terminal-setup', 'vim', 'keybindings',
+  'privacy-settings', 'output-style', 'statusline', 'add-dir', 'install-github-app', 'feedback', 'upgrade',
+])
+const CONFIG_WAIT_S = 600
+
+async function configRows($: $, command: string): Promise<ConfigRowView[]> {
+  const rows = (await $.config.list()).map(r => ({
+    key: r.key, label: r.label, kind: r.kind, value: r.value, options: r.options, isLocked: r.isLocked,
+  }))
+  if (command === 'model') return rows.filter(r => /model/i.test(r.key))
+  return rows.filter(r => r.kind === 'boolean' || r.kind === 'choice').slice(0, 40)
+}
+
+/** /config and /model as a live card: each click sets the row and redraws the card. */
+async function configSession($: $, m: FeishuMessage, command: string): Promise<void> {
+  const title = command === 'model' ? '模型' : '设置'
+  const rows = await configRows($, command)
+  if (command === 'model' && !rows.length) {
+    await reply($, m.messageId, '这里读不到模型设置，请在电脑上用 /model 切换。')
+    return
+  }
+  const id = rid()
+  await update($, pending, map => ({ ...map, [id]: { cardId: '', tool: `/${command}` } }))
+  const cardId = await sendCard($, m.chatId, configCard(id, title, rows, '点按钮或下拉框，立即生效。'))
+  if (!cardId) return void (await forget($, id))
+  await update($, pending, map => (map[id] ? { ...map, [id]: { cardId, tool: `/${command}` } } : map))
+  for (;;) {
+    const ev = await waitCardAction($, id, CONFIG_WAIT_S)
+    if (!ev) break
+    const value = parseObject(String(ev.action_value ?? '')) ?? {}
+    const key = typeof value.key === 'string' ? value.key : ''
+    const raw = typeof value.set === 'string' ? value.set : String(ev.option ?? '')
+    const row = (await configRows($, command)).find(r => r.key === key)
+    let note = ''
+    if (row && raw) {
+      const next = row.kind === 'boolean' ? raw === 'true' : raw
+      const res = await $.config.set({ key, value: next })
+      note = res.deny ? `没改成：${res.deny}` : `已把 **${row.label}** 设为 ${String(res.value)}`
+      $.ui.toast(`飞书：${note.replace(/\*\*/g, '')}`)
+    }
+    await patchCard($, cardId, configCard(id, title, await configRows($, command), note))
+  }
+  if (await forget($, id)) await patchCard($, cardId, configCard(id, `${title}（已过期，重新发 /${command}）`, []))
+}
+
+async function statusText($: $): Promise<string> {
+  const v = await $.session.version()
+  const cwd = await $.session.cwd()
+  const model = (await $.config.list()).find(r => /model/i.test(r.key))
+  return [
+    `Claude Code ${v.version}`,
+    `目录：${cwd}`,
+    model ? `模型：${String(model.value)}` : '',
+    await usageText($, 'cost'),
+  ].filter(Boolean).join('\n')
+}
+
+async function helpText($: $): Promise<string> {
+  const list = await $.command.list()
+  return list.slice(0, 80).map(c => `/${c.name} — ${c.description.slice(0, 60)}`).join('\n')
+}
 const COMMAND_WAIT_MS = 30_000
 
 async function runSlash($: $, m: FeishuMessage, command: string, args: string): Promise<void> {
@@ -258,6 +328,13 @@ async function runSlash($: $, m: FeishuMessage, command: string, args: string): 
   }
   if (USAGE_COMMANDS.has(command)) {
     await reply($, m.messageId, await usageText($, command))
+    return
+  }
+  if (command === 'config' || command === 'model') return configSession($, m, command)
+  if (command === 'status') return void (await reply($, m.messageId, await statusText($)))
+  if (command === 'help') return void (await reply($, m.messageId, await helpText($)))
+  if (LOCAL_ONLY.has(command)) {
+    await reply($, m.messageId, `/${command} 是电脑上的交互界面，需要在电脑上操作。`)
     return
   }
   await startWorking($, m.messageId)

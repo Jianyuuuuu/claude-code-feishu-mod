@@ -47,6 +47,7 @@ function harness(on: On, lines: string[], answerCard?: (argv: string[]) => strin
       const jq = argv[argv.indexOf('--jq') + 1] ?? ''
       const rid = /"([0-9a-f]{16})"/.exec(jq)?.[1] ?? ''
       await until(() => runs.some(r => r.includes('interactive')))
+      await tick() // a real consume waits; never spin
       return ok(answerCard ? answerCard([rid]) : '')
     }
     if (argv.includes('+messages-send')) return ok('{"ok":true,"data":{"message_id":"om_sent1"}}')
@@ -168,6 +169,41 @@ describe('bridge', () => {
     await until(() => h.runs.some(r => r.includes('+messages-reply')))
     expect(h.commands.length).toBe(0)
     expect(h.runs.find(r => r.includes('+messages-reply'))?.join(' ')).toContain('$1.50')
+    await $.command.run(typed('off'))
+  })
+
+  test('/config is a live card: a click sets the row', async ($, on) => {
+    const sets: string[] = []
+    let verbose = false
+    const h = harness(on, [event({ content: '/config' })], ([rid]) =>
+      sets.length ? '' : JSON.stringify({ operator_id: 'ou_owner', action_value: JSON.stringify({ rid, kind: 'config', key: 'verbose', set: 'true' }) }),
+    )
+    const engine = { plugin: 'engine', tier: 'core' } as const
+    on('config.list', async () => ({
+      value: [
+        { key: 'verbose', label: 'Verbose output', kind: 'boolean' as const, value: verbose, provider: engine, isLocked: false },
+        { key: 'model', label: 'Model', kind: 'choice' as const, value: 'opus', options: ['opus', 'sonnet'], provider: engine, isLocked: false },
+      ],
+    }))
+    on('config.set', async (_$, e) => {
+      sets.push(`${e.key}=${String(e.value)}`)
+      verbose = e.value === true
+      return { value: e.value }
+    })
+    await $.command.run(typed('on'))
+    await until(() => sets.length > 0 && h.runs.some(r => r.includes('PATCH')))
+    expect(sets).toEqual(['verbose=true'])
+    expect(h.runs.find(r => r.includes('interactive'))?.join(' ')).toContain('Verbose output')
+    expect(h.runs.find(r => r.includes('PATCH'))?.join(' ')).toContain('已把')
+    await $.command.run(typed('off'))
+  })
+
+  test('panels that only work at the computer are not run from Feishu', async ($, on) => {
+    const h = harness(on, [event({ content: '/resume' })])
+    await $.command.run(typed('on'))
+    await until(() => h.runs.some(r => r.includes('+messages-reply')))
+    expect(h.commands.length).toBe(0)
+    expect(h.runs.find(r => r.includes('+messages-reply'))?.join(' ')).toContain('需要在电脑上操作')
     await $.command.run(typed('off'))
   })
 

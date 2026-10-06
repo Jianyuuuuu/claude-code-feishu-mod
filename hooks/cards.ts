@@ -116,3 +116,49 @@ export function answersMarkdown(answers: Record<string, string>): string {
   const lines = Object.entries(answers).map(([q, a]) => `- ${q}\n  **${a}**`)
   return lines.length ? lines.join('\n') : '（未作答）'
 }
+
+export type ConfigRowView = {
+  key: string
+  label: string
+  kind: 'boolean' | 'choice' | 'text' | 'number'
+  value: boolean | string | number | readonly string[]
+  options?: readonly string[]
+  isLocked: boolean
+}
+
+const show = (v: ConfigRowView['value']): string => (Array.isArray(v) ? v.join(', ') : String(v))
+
+/** A settings card: toggles as buttons, choices as selects; the rest read-only. */
+export function configCard(rid: string, title: string, rows: readonly ConfigRowView[], note?: string): Card {
+  const elements: Card[] = []
+  if (note) elements.push({ tag: 'markdown', content: note })
+  for (const row of rows) {
+    const editable = !row.isLocked && (row.kind === 'boolean' || (row.kind === 'choice' && (row.options?.length ?? 0) > 0))
+    elements.push({ tag: 'markdown', content: `**${row.label}**：${show(row.value)}${row.isLocked ? '（已锁定）' : ''}` })
+    if (!editable) continue
+    if (row.kind === 'boolean') {
+      const next = row.value === true ? 'false' : 'true'
+      elements.push({
+        tag: 'action',
+        actions: [button(row.value === true ? '关闭' : '开启', row.value === true ? 'default' : 'primary', { rid, kind: 'config', key: row.key, set: next })],
+      })
+    } else {
+      elements.push({
+        tag: 'action',
+        actions: [{
+          tag: 'select_static',
+          placeholder: text(`选择 ${row.label}`),
+          initial_option: typeof row.value === 'string' ? row.value : undefined,
+          options: (row.options ?? []).slice(0, 50).map(o => ({ text: text(o), value: o })),
+          value: { rid, kind: 'config', key: row.key },
+        }],
+      })
+    }
+  }
+  if (!rows.length) elements.push({ tag: 'markdown', content: '没有可以在飞书里修改的设置。' })
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { title: text(title), template: 'blue' },
+    elements,
+  }
+}
