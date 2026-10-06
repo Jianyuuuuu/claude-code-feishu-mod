@@ -1,14 +1,33 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FeishuBridgeStatus } from '../types'
+import type { FeishuArmed, FeishuMirrored, FeishuModStatus, FeishuPendingCard } from '../types'
+import {
+  answersFromForm,
+  answersMarkdown,
+  approvalCard,
+  questionCard,
+  resolvedCard,
+  type ApprovalChoice,
+  type AskQuestion,
+  type Card,
+} from './cards'
 import {
   buildPrompt,
   chunkReply,
+  describeToolInput,
+  findResources,
+  isChatId,
   isOpenId,
+  localImages,
   markerOf,
+  MEDIA_TYPES,
   parseEvent,
+  parseObject,
+  parseSlash,
   REPLY_GUIDE,
+  safeName,
+  sentMessageId,
   splitLines,
   type FeishuMessage,
 } from './lib'
@@ -18,11 +37,20 @@ const PROFILE = 'claude-code'
 const LARK = 'lark-cli'
 const ALLOW_KEY = 'allow'
 const LAST_KEY = 'lastUnknownSender'
+const HOME_KEY = 'homeChat'
+const DOWNLOADS = '/tmp/feishu-mod'
+/** How long a card waits for a click, polled in short slices so a local answer stops it. */
+const CARD_WAIT_S = 1800
+const CARD_SLICE_S = 60
 
 const isOn = atom({ plugin: 'feishu-mod', key: 'isOn' } as const, false)
-const status = atom({ plugin: 'feishu-mod', key: 'status' } as const, 'off' as FeishuBridgeStatus)
+const status = atom({ plugin: 'feishu-mod', key: 'status' } as const, 'off' as FeishuModStatus)
 const turns = atom({ plugin: 'feishu-mod', key: 'turns' } as const, {} as Record<string, string>)
 const seen = atom({ plugin: 'feishu-mod', key: 'seen' } as const, [] as string[])
+const mirrored = atom({ plugin: 'feishu-mod', key: 'mirrored' } as const, [] as FeishuMirrored[])
+const armed = atom({ plugin: 'feishu-mod', key: 'armed' } as const, null as FeishuArmed | null)
+const pending = atom({ plugin: 'feishu-mod', key: 'pending' } as const, {} as Record<string, FeishuPendingCard>)
+const typing = atom({ plugin: 'feishu-mod', key: 'typing' } as const, {} as Record<string, string>)
 
 type $ = EngineInterface
 
@@ -31,14 +59,17 @@ let consumer: AsyncGenerator<unknown, unknown> | undefined
 let loopId = 0
 const warnedSenders = new Set<string>()
 
-const STATUS_TEXT: Record<FeishuBridgeStatus, string | undefined> = {
+const STATUS_TEXT: Record<FeishuModStatus, string | undefined> = {
   off: undefined,
   starting: '飞书 ⋯ 连接中',
   listening: '飞书 ● 在线',
   error: '飞书 ✕ 断开，重连中',
 }
 
-async function setStatus($: $, next: FeishuBridgeStatus): Promise<void> {
+const debug = ($: $, text: string) => $.ui.log(`${PLUGIN}: ${text}`, { to: 'debug' })
+const rid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+
+async function setStatus($: $, next: FeishuModStatus): Promise<void> {
   await update($, status, () => next)
   $.ui.status(STATUS_TEXT[next])
 }
@@ -48,28 +79,54 @@ async function allowList($: $): Promise<string[]> {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
 }
 
-async function lark($: $, args: string[]) {
-  return $.process.run([LARK, '--profile', PROFILE, ...args], { timeoutMs: 60_000 })
+async function homeChat($: $): Promise<string | null> {
+  const value = await $.store.get(HOME_KEY)
+  return typeof value === 'string' && isChatId(value) ? value : null
 }
 
-async function react($: $, messageId: string, emoji: string): Promise<void> {
+/** The bridge routes to Feishu only while it is on and knows where to send. */
+async function remoteChat($: $): Promise<string | null> {
+  return (await read($, isOn)) ? homeChat($) : null
+}
+
+// ── lark-cli ────────────────────────────────────────────────────────────────
+
+function lark($: $, args: string[], init: { cwd?: string; timeoutMs?: number } = {}) {
+  return $.process.run([LARK, '--profile', PROFILE, ...args], { timeoutMs: 60_000, ...init })
+}
+
+async function react($: $, messageId: string, emoji: string): Promise<string | null> {
   const res = await lark($, [
-    'api', 'POST', `/open-apis/im/v1/messages/${messageId}/reactions`,
-    '--as', 'bot',
+    'api', 'POST', `/open-apis/im/v1/messages/${messageId}/reactions`, '--as', 'bot',
     '--data', JSON.stringify({ reaction_type: { emoji_type: emoji } }),
   ]).catch(() => undefined)
-  if (res && res.exitCode !== 0) $.ui.log(`${PLUGIN}: reaction failed: ${res.stderr || res.stdout}`, { to: 'debug' })
+  if (res && res.exitCode !== 0) debug($, `reaction failed: ${res.stderr || res.stdout}`)
+  return res ? (/"reaction_id"\s*:\s*"([^"]+)"/.exec(res.stdout)?.[1] ?? null) : null
+}
+
+/** Hermes' processing badge: Typing while working, removed on reply, CrossMark on failure. */
+async function startWorking($: $, messageId: string): Promise<void> {
+  const id = await react($, messageId, 'Typing')
+  if (id) await update($, typing, map => ({ ...map, [messageId]: id }))
+}
+
+async function stopWorking($: $, messageId: string, isFailed: boolean): Promise<void> {
+  const id = (await read($, typing))[messageId]
+  if (id) {
+    await update($, typing, map => {
+      const { [messageId]: _, ...rest } = map
+      return rest
+    })
+    await lark($, ['api', 'DELETE', `/open-apis/im/v1/messages/${messageId}/reactions/${id}`, '--as', 'bot']).catch(() => undefined)
+  }
+  if (isFailed) await react($, messageId, 'CrossMark')
 }
 
 async function reply($: $, messageId: string, text: string): Promise<boolean> {
-  const pieces = chunkReply(text)
-  for (const [i, piece] of pieces.entries()) {
+  for (const [i, piece] of chunkReply(text).entries()) {
     const res = await lark($, [
-      'im', '+messages-reply',
-      '--as', 'bot',
-      '--message-id', messageId,
-      '--markdown', piece,
-      '--idempotency-key', `${messageId}-${i}`.slice(0, 50),
+      'im', '+messages-reply', '--as', 'bot', '--message-id', messageId,
+      '--markdown', piece, '--idempotency-key', `${messageId}-${i}`.slice(0, 50),
     ])
     if (res.exitCode !== 0) {
       $.ui.toast(`飞书回复失败：${(res.stderr || res.stdout).slice(0, 300)}`)
@@ -79,15 +136,165 @@ async function reply($: $, messageId: string, text: string): Promise<boolean> {
   return true
 }
 
+async function replyImage($: $, messageId: string, path: string): Promise<void> {
+  const cut = path.lastIndexOf('/')
+  const res = await lark($, ['im', '+messages-reply', '--as', 'bot', '--message-id', messageId, '--image', path.slice(cut + 1)], {
+    cwd: path.slice(0, cut) || '/',
+  })
+  if (res.exitCode !== 0) debug($, `image reply failed: ${res.stderr || res.stdout}`)
+}
+
+async function sendMarkdown($: $, chatId: string, text: string): Promise<string | null> {
+  const res = await lark($, ['im', '+messages-send', '--as', 'bot', '--chat-id', chatId, '--markdown', text])
+  if (res.exitCode !== 0) debug($, `send failed: ${res.stderr || res.stdout}`)
+  return sentMessageId(res.stdout)
+}
+
+async function sendCard($: $, chatId: string, card: Card): Promise<string | null> {
+  const res = await lark($, [
+    'im', '+messages-send', '--as', 'bot', '--chat-id', chatId,
+    '--msg-type', 'interactive', '--content', JSON.stringify(card),
+  ])
+  if (res.exitCode !== 0) $.ui.toast(`飞书卡片发送失败：${(res.stderr || res.stdout).slice(0, 300)}`)
+  return sentMessageId(res.stdout)
+}
+
+async function patchCard($: $, messageId: string, card: Card): Promise<void> {
+  const res = await lark($, [
+    'api', 'PATCH', `/open-apis/im/v1/messages/${messageId}`, '--as', 'bot',
+    '--data', JSON.stringify({ content: JSON.stringify(card) }),
+  ]).catch(() => undefined)
+  if (res && res.exitCode !== 0) debug($, `card update failed: ${res.stderr || res.stdout}`)
+}
+
+/**
+ * Waits for a click on the card tagged `rid` by an allowed user. The wait is a
+ * `$.process.run`, so it costs the calling hook none of its own time budget.
+ */
+async function waitCardAction($: $, id: string, seconds: number): Promise<Record<string, unknown> | null> {
+  const deadline = (await $.clock.now()) + seconds * 1000
+  for (;;) {
+    // The card was settled at the computer, or the bridge went off: stop listening.
+    if (!(await read($, pending))[id] || !(await read($, isOn))) return null
+    const left = Math.floor((deadline - (await $.clock.now())) / 1000)
+    if (left < 5) return null
+    const slice = Math.min(left, CARD_SLICE_S)
+    const res = await lark($, [
+      'event', 'consume', 'card.action.trigger', '--as', 'bot', '--max-events', '1', '--timeout', `${slice}s`,
+      '--jq', `select((.action_value | fromjson? | .rid) == "${id}")`,
+    ], { timeoutMs: slice * 1000 + 20_000 }).catch(err => {
+      debug($, `card wait failed: ${String(err)}`)
+      return null
+    })
+    if (!res) return null
+    const line = res.stdout.split('\n').find(l => l.trim().startsWith('{'))
+    const ev = line ? parseObject(line) : null
+    if (!ev) continue
+    if ((await allowList($)).includes(String(ev.operator_id ?? ''))) return ev
+    debug($, `ignored a card click by ${String(ev.operator_id)}`)
+  }
+}
+
+async function forget($: $, id: string): Promise<FeishuPendingCard | undefined> {
+  const card = (await read($, pending))[id]
+  await update($, pending, map => {
+    const { [id]: _, ...rest } = map
+    return rest
+  })
+  return card
+}
+
+// ── inbound ─────────────────────────────────────────────────────────────────
+
+async function downloadResources($: $, m: FeishuMessage): Promise<string[]> {
+  if (!MEDIA_TYPES.has(m.messageType)) return []
+  const raw = await lark($, ['api', 'GET', `/open-apis/im/v1/messages/${m.messageId}`, '--as', 'bot'])
+  const data = parseObject(raw.stdout)?.data as { items?: Array<{ body?: { content?: string } }> } | undefined
+  const body = parseObject(data?.items?.[0]?.body?.content ?? '')
+  const resources = findResources(body).slice(0, 10)
+  if (!resources.length) return []
+  const dir = `${DOWNLOADS}/${m.messageId}`
+  await $.process.run(['mkdir', '-p', dir])
+  for (const r of resources) {
+    const res = await lark($, [
+      'im', '+messages-resources-download', '--as', 'bot', '--message-id', m.messageId,
+      '--file-key', r.key, '--type', r.type, '--output', `${dir}/${safeName(r)}`,
+    ], { timeoutMs: 120_000 })
+    if (res.exitCode !== 0 && r.type === 'image') {
+      debug($, `download ${r.key} as image failed, retrying as file`)
+      await lark($, [
+        'im', '+messages-resources-download', '--as', 'bot', '--message-id', m.messageId,
+        '--file-key', r.key, '--type', 'file', '--output', `${dir}/${safeName(r)}`,
+      ], { timeoutMs: 120_000 })
+    } else if (res.exitCode !== 0) debug($, `download ${r.key} failed: ${res.stderr || res.stdout}`)
+  }
+  const listed = await $.process.run(['ls', '-1', dir])
+  return listed.stdout.split('\n').map(f => f.trim()).filter(Boolean).map(f => `${dir}/${f}`)
+}
+
+/** Commands that open a panel at the computer: answered here from the session's own figures. */
+async function usageText($: $, command: string): Promise<string> {
+  const u = await $.session.usage()
+  const k = (n?: number) => (n === undefined ? '?' : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+  const lines = [
+    `上下文：${k(u.context.tokens)} / ${k(u.context.window)} tokens${u.context.percent === undefined ? '' : `（${Math.round(u.context.percent)}%）`}`,
+  ]
+  if (command !== 'context') {
+    if (u.cost) lines.unshift(`本会话花费：$${u.cost.usd.toFixed(2)}`)
+    for (const r of u.rateLimits) {
+      lines.push(`${r.kind}：已用 ${Math.round(r.percentUsed)}%${r.resetsAt ? `，${r.resetsAt} 重置` : ''}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+const USAGE_COMMANDS = new Set(['cost', 'usage', 'context', 'stats'])
+const COMMAND_WAIT_MS = 30_000
+
+async function runSlash($: $, m: FeishuMessage, command: string, args: string): Promise<void> {
+  if (command === 'feishu') {
+    await reply($, m.messageId, await feishuCommand($, args))
+    return
+  }
+  if (USAGE_COMMANDS.has(command)) {
+    await reply($, m.messageId, await usageText($, command))
+    return
+  }
+  await startWorking($, m.messageId)
+  // A command that starts a turn (a skill, a prompt command) answers there.
+  await update($, armed, () => ({ messageId: m.messageId, until: Date.now() + 60_000 }))
+  try {
+    const ran = $.command.run({ command, args }).then(r => (r.text ?? '').trim())
+    const out = await Promise.race([ran, $.clock.sleep(COMMAND_WAIT_MS).then(() => null)])
+    if (out === null) {
+      void ran.catch(() => undefined)
+      await update($, armed, a => (a?.messageId === m.messageId ? null : a))
+      await reply($, m.messageId, `/${command} 在电脑上打开了交互界面，飞书里显示不了，请到电脑上查看（按 Esc 关闭）。`)
+      await stopWorking($, m.messageId, false)
+      return
+    }
+    if (out) await reply($, m.messageId, '```\n' + out.slice(0, 6000) + '\n```')
+    // A turn the command started took the armed message and answers it; otherwise we are done.
+    const startedTurn = Object.values(await read($, turns)).includes(m.messageId)
+    if (!startedTurn) {
+      await update($, armed, a => (a?.messageId === m.messageId ? null : a))
+      if (!out) await reply($, m.messageId, `/${command} 已执行。`)
+      await stopWorking($, m.messageId, false)
+    }
+  } catch (err) {
+    await update($, armed, () => null)
+    await reply($, m.messageId, `/${command} 执行失败：${String(err).slice(0, 500)}`)
+    await stopWorking($, m.messageId, true)
+  }
+}
+
 async function handle($: $, m: FeishuMessage): Promise<void> {
-  $.ui.log(`${PLUGIN}: event ${m.messageId} from ${m.senderId} (${m.chatType}/${m.messageType})`, { to: 'debug' })
+  debug($, `event ${m.messageId} from ${m.senderId} (${m.chatType}/${m.messageType})`)
   if (m.senderType && m.senderType !== 'user') return
-  const already = (await read($, seen)).includes(m.messageId)
-  if (already) return
+  if ((await read($, seen)).includes(m.messageId)) return
   await update($, seen, list => [...list, m.messageId].slice(-200))
 
-  const allowed = await allowList($)
-  if (!allowed.includes(m.senderId)) {
+  if (!(await allowList($)).includes(m.senderId)) {
     await $.store.set(LAST_KEY, m.senderId)
     if (!warnedSenders.has(m.senderId)) {
       warnedSenders.add(m.senderId)
@@ -95,10 +302,21 @@ async function handle($: $, m: FeishuMessage): Promise<void> {
     }
     return
   }
-  if (!m.content.trim()) return
+  if (m.chatType === 'p2p' && isChatId(m.chatId)) await $.store.set(HOME_KEY, m.chatId)
 
-  void react($, m.messageId, 'OnIt').catch(() => undefined)
-  await $.prompt.submit({ text: buildPrompt(m), asUser: true })
+  const slash = m.messageType === 'text' ? parseSlash(m.content) : null
+  if (slash) {
+    void runSlash($, m, slash.command, slash.args).catch(err => debug($, `slash: ${String(err)}`))
+    return
+  }
+
+  await startWorking($, m.messageId)
+  const files = await downloadResources($, m).catch(err => {
+    debug($, `download: ${String(err)}`)
+    return [] as string[]
+  })
+  if (!m.content.trim() && !files.length) return stopWorking($, m.messageId, false)
+  await $.prompt.submit({ text: buildPrompt(m, files), asUser: true })
 }
 
 async function runConsumer($: $): Promise<void> {
@@ -116,18 +334,18 @@ async function runConsumer($: $): Promise<void> {
         if (id !== loopId) break
         if ((await read($, status)) !== 'listening') await setStatus($, 'listening')
         if (chunk.stream === 'stderr') {
-          $.ui.log(`${PLUGIN}: ${chunk.text.trim()}`, { to: 'debug' })
+          debug($, chunk.text.trim())
           continue
         }
         const { lines, rest } = splitLines(buffer, chunk.text)
         buffer = rest
         for (const line of lines) {
           const message = parseEvent(line)
-          if (message) await handle($, message).catch(err => $.ui.log(`${PLUGIN}: ${String(err)}`, { to: 'debug' }))
+          if (message) await handle($, message).catch(err => debug($, String(err)))
         }
       }
     } catch (err) {
-      $.ui.log(`${PLUGIN}: consumer failed: ${String(err)}`, { to: 'debug' })
+      debug($, `consumer failed: ${String(err)}`)
     }
     if (id !== loopId || !(await read($, isOn))) break
     await setStatus($, 'error')
@@ -143,6 +361,47 @@ async function stopConsumer($: $): Promise<void> {
   await setStatus($, 'off')
 }
 
+// ── /feishu ─────────────────────────────────────────────────────────────────
+
+async function feishuCommand($: $, argText: string): Promise<string> {
+  const [verb = 'status', arg = ''] = argText.trim().split(/\s+/)
+  switch (verb) {
+    case 'on': {
+      if (await read($, isOn)) return '飞书桥接已经开着。'
+      await update($, isOn, () => true)
+      void runConsumer($).catch(() => undefined)
+      const allowed = await allowList($)
+      return allowed.length
+        ? `飞书桥接已开启（profile ${PROFILE}），授权用户 ${allowed.length} 个。`
+        : `飞书桥接已开启（profile ${PROFILE}）。还没有授权用户：先给机器人发一条消息，再运行 /feishu allow last。`
+    }
+    case 'off':
+      await update($, isOn, () => false)
+      await stopConsumer($)
+      return '飞书桥接已关闭。'
+    case 'allow':
+    case 'deny': {
+      const last = await $.store.get(LAST_KEY)
+      const target = arg === 'last' && typeof last === 'string' ? last : arg
+      if (!isOpenId(target)) return '需要一个 open_id（ou_xxx），或用 last 表示最近一个未授权的发送者。'
+      const list = await allowList($)
+      const nextList = verb === 'allow' ? [...new Set([...list, target])] : list.filter(x => x !== target)
+      await $.store.set(ALLOW_KEY, nextList)
+      return `${verb === 'allow' ? '已授权' : '已移除'} ${target}。当前授权：${nextList.join(', ') || '无'}`
+    }
+    default:
+      return [
+        `状态：${await read($, status)}（profile ${PROFILE}）`,
+        `授权用户：${(await allowList($)).join(', ') || '无'}`,
+        `飞书会话：${(await homeChat($)) ?? '未知（先在飞书私聊机器人一次）'}`,
+        `等待中的飞书卡片：${Object.keys(await read($, pending)).length}`,
+        `最近未授权的发送者：${String((await $.store.get(LAST_KEY)) ?? '无')}`,
+      ].join('\n')
+  }
+}
+
+// ── hooks ───────────────────────────────────────────────────────────────────
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -156,57 +415,46 @@ export const register: Register = on => {
     return started
   })
 
-  on('command.run', { command: 'feishu' }, async ($, e) => {
-    const [verb = 'status', arg = ''] = e.args.trim().split(/\s+/)
-    switch (verb) {
-      case 'on': {
-        if (await read($, isOn)) return { text: '飞书桥接已经开着。' }
-        await update($, isOn, () => true)
-        void runConsumer($).catch(() => undefined)
-        const allowed = await allowList($)
-        return {
-          text: allowed.length
-            ? `飞书桥接已开启（profile ${PROFILE}），授权用户 ${allowed.length} 个。`
-            : `飞书桥接已开启（profile ${PROFILE}）。还没有授权用户：先给机器人发一条消息，按提示运行 /feishu allow。`,
-        }
-      }
-      case 'off':
-        await update($, isOn, () => false)
-        await stopConsumer($)
-        return { text: '飞书桥接已关闭。' }
-      case 'allow':
-      case 'deny': {
-        const last = await $.store.get(LAST_KEY)
-        const target = arg === 'last' && typeof last === 'string' ? last : arg
-        if (!isOpenId(target)) return { text: '需要一个 open_id（ou_xxx），或用 last 表示最近一个未授权的发送者。' }
-        const list = await allowList($)
-        const nextList = verb === 'allow' ? [...new Set([...list, target])] : list.filter(x => x !== target)
-        await $.store.set(ALLOW_KEY, nextList)
-        return { text: `${verb === 'allow' ? '已授权' : '已移除'} ${target}。当前授权：${nextList.join(', ') || '无'}` }
-      }
-      default: {
-        const allowed = await allowList($)
-        return {
-          text: [
-            `状态：${await read($, status)}（profile ${PROFILE}）`,
-            `授权用户：${allowed.join(', ') || '无'}`,
-            `最近未授权的发送者：${String((await $.store.get(LAST_KEY)) ?? '无')}`,
-          ].join('\n'),
-        }
+  on('command.run', { command: 'feishu' }, async ($, e) => ({ text: await feishuCommand($, e.args) }))
+
+  on('prompt.submit', async ($, e, next) => {
+    // Our own submissions carry the reply rules as context the person never sees.
+    if (e.origin?.kind === 'plugin' && e.origin.name === PLUGIN && markerOf(e.text)) {
+      return next({ ...e, context: [...(e.context ?? []), REPLY_GUIDE] })
+    }
+    // A prompt typed at the computer is mirrored to Feishu, and its answer follows it there.
+    const chat = e.origin?.kind === 'composer' ? await remoteChat($) : null
+    if (chat && e.text.trim()) {
+      const messageId = await sendMarkdown($, chat, `💻 **电脑端**\n${e.text.slice(0, 3000)}`)
+      if (messageId && e.turnId) {
+        const turnId = e.turnId
+        await update($, turns, map => (map[turnId] ? map : { ...map, [turnId]: messageId }))
+      } else if (messageId) {
+        await update($, mirrored, list => [...list, { text: e.text, messageId }].slice(-20))
       }
     }
-  })
-
-  // Our own submissions carry the reply rules as context the person never sees.
-  on('prompt.submit', ($, e, next) =>
-    e.origin.kind === 'plugin' && e.origin.name === PLUGIN && markerOf(e.text)
-      ? next({ ...e, context: [...(e.context ?? []), REPLY_GUIDE] })
-      : next(e),
-  )
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
-    const messageId = markerOf(e.text)
-    if (messageId) await update($, turns, map => ({ ...map, [e.turnId]: messageId }))
+    let messageId = markerOf(e.text)
+    if (!messageId) {
+      const queue = await read($, mirrored)
+      const hit = queue.find(q => q.text === e.text || e.text.startsWith(q.text))
+      if (hit) {
+        messageId = hit.messageId
+        await update($, mirrored, list => list.filter(q => q !== hit && q.messageId !== hit.messageId))
+      }
+    }
+    if (!messageId) {
+      const pending = await read($, armed)
+      if (pending && pending.until > Date.now()) messageId = pending.messageId
+      if (pending) await update($, armed, () => null)
+    }
+    if (messageId) {
+      const id = messageId
+      await update($, turns, map => ({ ...map, [e.turnId]: id }))
+    }
     return next(e)
   })
 
@@ -226,7 +474,73 @@ export const register: Register = on => {
       : e.reason === 'refusal' ? '（这一轮被模型拒绝了）'
       : '（这一轮因 API 错误中断）'
     const ok = await reply($, messageId, text)
-    if (ok) void react($, messageId, 'DONE').catch(() => undefined)
+    if (e.reason === 'answer') {
+      for (const path of localImages(e.answer)) {
+        const st = await $.fs.stat(path).catch(() => null)
+        if (st) await replyImage($, messageId, path)
+      }
+    }
+    await stopWorking($, messageId, !ok || e.reason !== 'answer')
+    return result
+  })
+
+  // A permission ask (AskUserQuestion included) goes to Feishu while the dialog
+  // stays up at the computer: whichever answers first settles it.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const chat = await remoteChat($)
+    if (!chat) return next(e)
+    const input = (typeof e.tool_input === 'object' && e.tool_input !== null ? e.tool_input : {}) as Record<string, unknown>
+    const isQuestion = e.tool_name === 'AskUserQuestion' && Array.isArray(input.questions)
+    const questions = (isQuestion ? input.questions : []) as AskQuestion[]
+    const summary = isQuestion ? '' : describeToolInput(e.tool_name, input)
+
+    const id = rid()
+    await update($, pending, map => ({ ...map, [id]: { cardId: '', tool: e.tool_name } }))
+    const click = waitCardAction($, id, CARD_WAIT_S)
+    const cardId = await sendCard($, chat, isQuestion ? questionCard(id, questions) : approvalCard(id, e.tool_name, summary))
+    if (!cardId) {
+      await forget($, id)
+      return next(e)
+    }
+    await update($, pending, map => (map[id] ? { ...map, [id]: { cardId, tool: e.tool_name } } : map))
+
+    const ev = await click
+    if (!(await forget($, id)) || !ev) {
+      // Settled at the computer (its card is updated there), or timed out.
+      if (ev === null && (await read($, isOn))) {
+        await patchCard($, cardId, resolvedCard('已超时', 'grey', '回到电脑上处理。'))
+      }
+      return next(e)
+    }
+
+    if (isQuestion) {
+      const answers = answersFromForm(questions, parseObject(String(ev.form_value ?? '')) ?? {})
+      await patchCard($, cardId, resolvedCard('已回答', 'green', answersMarkdown(answers)))
+      $.ui.toast('飞书：已回答问题')
+      return { decision: { behavior: 'allow' as const, updatedInput: { ...input, answers } } }
+    }
+
+    const choice = (parseObject(String(ev.action_value ?? ''))?.choice ?? 'deny') as ApprovalChoice
+    const label = choice === 'once' ? '已允许一次' : choice === 'session' ? '本会话不再询问' : '已拒绝'
+    await patchCard($, cardId, resolvedCard(`${label}：${e.tool_name}`, choice === 'deny' ? 'red' : 'green', summary))
+    $.ui.toast(`飞书：${label} ${e.tool_name}`)
+    if (choice === 'deny') return { decision: { behavior: 'deny' as const, message: '用户在飞书上拒绝了这次操作。' } }
+    if (choice === 'once') return { decision: { behavior: 'allow' as const } }
+    const rules = (e.permission_suggestions ?? []).filter(u => u.type === 'addRules')
+    const updatedPermissions = rules.length
+      ? rules.map(u => ({ ...u, destination: 'session' as const }))
+      : [{ type: 'addRules' as const, rules: [{ toolName: e.tool_name }], behavior: 'allow' as const, destination: 'session' as const }]
+    return { decision: { behavior: 'allow' as const, updatedPermissions } }
+  }).catch(($, e, next) => next(e))
+
+  // Once a tool call settles, any of its cards still waiting were answered at the computer.
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    const waiting = Object.entries(await read($, pending)).filter(([, card]) => card.tool === e.tool && card.cardId)
+    for (const [id, card] of waiting) {
+      await forget($, id)
+      await patchCard($, card.cardId, resolvedCard(`已在电脑上处理：${e.tool}`, 'grey', '这张卡片不再需要操作。'))
+    }
     return result
   })
 
