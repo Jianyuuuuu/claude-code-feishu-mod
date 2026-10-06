@@ -2,7 +2,7 @@ export type FeishuBridgeStatus = 'off' | 'starting' | 'listening' | 'error'
 
 declare module 'claude-code' {
   interface PluginState {
-    'feishu-bridge': {
+    'feishu-mod': {
       /** Whether the bridge should be consuming events in this session. */
       isOn: boolean
       status: FeishuBridgeStatus

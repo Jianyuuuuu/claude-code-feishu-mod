@@ -1,4 +1,4 @@
-# feishu-bridge
+# feishu-mod
 
 在飞书 / Lark 里和 Claude Code 对话：给机器人发的私聊消息会作为一轮提问送进你电脑上正在运行的 Claude Code 会话，回答自动回复到原消息下。
 
@@ -9,7 +9,7 @@ A Claude Code mod (function-hooks plugin) that bridges a Feishu/Lark bot to your
 在 Claude Code 终端会话里输入：
 
 ```
-/plugin install feishu-bridge --marketplace Jianyuuuuu/claude-code-feishu-bridge
+/plugin install feishu-mod --marketplace Jianyuuuuu/claude-code-feishu-mod
 ```
 
 提示 `Add marketplace?` 时按 `y`，然后选择安装范围（默认 user）。

@@ -13,16 +13,16 @@ import {
   type FeishuMessage,
 } from './lib'
 
-const PLUGIN = 'feishu-bridge'
+const PLUGIN = 'feishu-mod'
 const PROFILE = 'claude-code'
 const LARK = 'lark-cli'
 const ALLOW_KEY = 'allow'
 const LAST_KEY = 'lastUnknownSender'
 
-const isOn = atom({ plugin: 'feishu-bridge', key: 'isOn' } as const, false)
-const status = atom({ plugin: 'feishu-bridge', key: 'status' } as const, 'off' as FeishuBridgeStatus)
-const turns = atom({ plugin: 'feishu-bridge', key: 'turns' } as const, {} as Record<string, string>)
-const seen = atom({ plugin: 'feishu-bridge', key: 'seen' } as const, [] as string[])
+const isOn = atom({ plugin: 'feishu-mod', key: 'isOn' } as const, false)
+const status = atom({ plugin: 'feishu-mod', key: 'status' } as const, 'off' as FeishuBridgeStatus)
+const turns = atom({ plugin: 'feishu-mod', key: 'turns' } as const, {} as Record<string, string>)
+const seen = atom({ plugin: 'feishu-mod', key: 'seen' } as const, [] as string[])
 
 type $ = EngineInterface
 

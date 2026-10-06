@@ -1,5 +1,5 @@
 {
   "name": "jianyuuuuu",
   "owner": { "name": "Zheng Jianyu", "email": "jianyuuuuu@gmail.com" },
-  "plugins": [{ "name": "feishu-bridge", "source": "./" }]
+  "plugins": [{ "name": "feishu-mod", "source": "./" }]
 }
