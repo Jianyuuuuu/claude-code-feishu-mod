@@ -156,3 +156,73 @@ export const REPLY_GUIDE = [
   '用简体中文，结论先行，简短；可以用简单的 Markdown（加粗、列表、代码块），不要用表格。',
   '不要在回答里自己调用 lark-cli 发送回复，桥接会处理。要发图片给对方时，在回答里写出图片的本地绝对路径即可。',
 ].join('\n')
+
+export type UsageView = {
+  version?: string
+  cwd?: string
+  home?: string
+  model?: string
+  costUsd?: number
+  context: { tokens?: number; window: number; percent?: number }
+  rateLimits: ReadonlyArray<{ kind: string; percentUsed: number; resetsAt?: string }>
+}
+
+export const LIMIT_NAMES: Record<string, string> = {
+  five_hour: '5 小时额度',
+  seven_day: '7 天额度',
+  seven_day_opus: '7 天额度（Opus）',
+  seven_day_sonnet: '7 天额度（Sonnet）',
+  spend_limit: '花费上限',
+}
+
+export const tokens = (n?: number): string =>
+  n === undefined ? '?' : n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${+(n / 1000).toFixed(1)}k` : String(n)
+
+export function bar(percent: number, width = 10): string {
+  const filled = Math.max(0, Math.min(width, Math.round((percent / 100) * width)))
+  return '▓'.repeat(filled) + '░'.repeat(width - filled)
+}
+
+/** "2 小时 59 分后" / "3 天 7 小时后", from now until `iso`. */
+export function untilText(iso: string, now: number): string {
+  const ms = Date.parse(iso) - now
+  if (!Number.isFinite(ms)) return ''
+  if (ms <= 0) return '即将'
+  const min = Math.round(ms / 60_000)
+  const d = Math.floor(min / 1440)
+  const h = Math.floor((min % 1440) / 60)
+  const m = min % 60
+  if (d) return `${d} 天${h ? ` ${h} 小时` : ''}后`
+  if (h) return `${h} 小时${m ? ` ${m} 分` : ''}后`
+  return `${m} 分钟后`
+}
+
+/** Local wall time of `iso`, "10/7 02:10", in the given offset (minutes east of UTC). */
+export function localTime(iso: string, offsetMin: number): string {
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return ''
+  const d = new Date(t + offsetMin * 60_000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`
+}
+
+/** The usage / status reply, as Feishu markdown. `full` adds version, directory and model. */
+export function formatUsage(u: UsageView, now: number, offsetMin: number, full: boolean): string {
+  const lines: string[] = []
+  if (full && u.version) lines.push(`**Claude Code ${u.version}**`)
+  if (full && u.cwd) lines.push(`📁 ${u.home && u.cwd.startsWith(u.home) ? `~${u.cwd.slice(u.home.length)}` : u.cwd}`)
+  if (full && u.model) lines.push(`🧠 模型：${u.model}`)
+  if (u.costUsd !== undefined) lines.push(`💰 本会话花费：**$${u.costUsd.toFixed(2)}**`)
+  const pct = u.context.percent ?? (u.context.tokens !== undefined ? (u.context.tokens / u.context.window) * 100 : undefined)
+  lines.push(`📊 上下文：${tokens(u.context.tokens)} / ${tokens(u.context.window)}${pct === undefined ? '' : `（${Math.round(pct)}%）`}`)
+  if (pct !== undefined) lines.push(bar(pct))
+  if (u.rateLimits.length) lines.push('')
+  for (const r of u.rateLimits) {
+    const name = LIMIT_NAMES[r.kind] ?? r.kind
+    const warn = r.percentUsed >= 80 ? ' ⚠️' : ''
+    const reset = r.resetsAt ? `，${untilText(r.resetsAt, now)}重置（${localTime(r.resetsAt, offsetMin)}）` : ''
+    lines.push(`⏱ ${name}：已用 **${Math.round(r.percentUsed)}%**${warn}${reset}`)
+    lines.push(bar(r.percentUsed))
+  }
+  return lines.join('\n')
+}

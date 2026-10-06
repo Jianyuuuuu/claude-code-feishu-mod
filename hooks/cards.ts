@@ -128,8 +128,8 @@ export type ConfigRowView = {
 
 const show = (v: ConfigRowView['value']): string => (Array.isArray(v) ? v.join(', ') : String(v))
 
-/** A settings card: toggles as buttons, choices as selects; the rest read-only. */
-export function configCard(rid: string, title: string, rows: readonly ConfigRowView[], note?: string): Card {
+/** A settings card: toggles as buttons, choices as selects; the rest read-only. `view` redraws it. */
+export function configCard(view: string, title: string, rows: readonly ConfigRowView[], note?: string): Card {
   const elements: Card[] = []
   if (note) elements.push({ tag: 'markdown', content: note })
   for (const row of rows) {
@@ -140,7 +140,7 @@ export function configCard(rid: string, title: string, rows: readonly ConfigRowV
       const next = row.value === true ? 'false' : 'true'
       elements.push({
         tag: 'action',
-        actions: [button(row.value === true ? '关闭' : '开启', row.value === true ? 'default' : 'primary', { rid, kind: 'config', key: row.key, set: next })],
+        actions: [button(row.value === true ? '关闭' : '开启', row.value === true ? 'default' : 'primary', { kind: 'config', view, key: row.key, set: next })],
       })
     } else {
       elements.push({
@@ -150,7 +150,7 @@ export function configCard(rid: string, title: string, rows: readonly ConfigRowV
           placeholder: text(`选择 ${row.label}`),
           initial_option: typeof row.value === 'string' ? row.value : undefined,
           options: (row.options ?? []).slice(0, 50).map(o => ({ text: text(o), value: o })),
-          value: { rid, kind: 'config', key: row.key },
+          value: { kind: 'config', view, key: row.key },
         }],
       })
     }
@@ -160,5 +160,44 @@ export function configCard(rid: string, title: string, rows: readonly ConfigRowV
     config: { wide_screen_mode: true, update_multi: true },
     header: { title: text(title), template: 'blue' },
     elements,
+  }
+}
+
+export type StatusView = {
+  title: string
+  subtitle?: string
+  costUsd?: number
+  contextPercent?: number
+  contextText: string
+  model?: string
+  limits: ReadonlyArray<{ name: string; percent: number; reset?: string }>
+  footnote?: string
+}
+
+const tone = (p: number) => (p >= 80 ? 'red' : p >= 50 ? 'orange' : 'green')
+const md = (content: string, align: 'left' | 'center' | 'right' = 'left'): Card => ({ tag: 'markdown', content, text_align: align })
+const column = (elements: Card[], weight = 1): Card => ({ tag: 'column', width: 'weighted', weight, vertical_align: 'center', elements })
+
+/** "claude-opus-5-5" -> "Opus 5.5"; anything else as given. */
+export function prettyModel(id: string): string {
+  const m = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(id)
+  return m ? `${(m[1] ?? '').charAt(0).toUpperCase()}${(m[1] ?? '').slice(1)} ${m[2]}.${m[3]}` : id
+}
+
+/** /status, /cost, /usage as a small card: one line each, percentages colored. */
+export function statusCard(v: StatusView): Card {
+  const pct = (p: number) => `<font color='${tone(p)}'>**${Math.round(p)}%**</font>`
+  const lines: string[] = []
+  const head: string[] = []
+  if (v.costUsd !== undefined) head.push(`花费 **$${v.costUsd.toFixed(2)}**`)
+  head.push(`上下文 ${v.contextPercent === undefined ? v.contextText : pct(v.contextPercent)}`)
+  lines.push(head.join('　'))
+  for (const l of v.limits) lines.push(`${l.name} ${pct(l.percent)}${l.reset ? `　<font color='grey'>${l.reset}</font>` : ''}`)
+  if (v.footnote) lines.push(`<font color='grey'>${v.footnote}</font>`)
+  const title = [v.title, v.model ? prettyModel(v.model) : ''].filter(Boolean).join(' · ')
+  return {
+    config: { wide_screen_mode: true },
+    header: { title: text(title), template: 'blue' },
+    elements: [{ tag: 'markdown', content: lines.join('\n') }],
   }
 }

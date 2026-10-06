@@ -25,6 +25,8 @@ declare module 'claude-code' {
       pending: Record<string, FeishuPendingCard>
       /** message_id -> the reaction_id of its Typing badge. */
       typing: Record<string, string>
+      /** The model the last main-loop turn ran on. */
+      model: string
     }
   }
 }

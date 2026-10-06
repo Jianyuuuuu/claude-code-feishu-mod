@@ -1,8 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { answersFromForm, questionCard } from './cards'
-import { buildPrompt, chunkReply, findResources, localImages, markerOf, parseEvent, parseSlash, splitLines } from './lib'
+import { answersFromForm, prettyModel, questionCard } from './cards'
+import { buildPrompt, chunkReply, findResources, formatUsage, localImages, markerOf, parseEvent, parseSlash, splitLines } from './lib'
 
 const typed = (args: string) => ({
   command: 'feishu',
@@ -36,20 +36,49 @@ function harness(on: On, lines: string[], answerCard?: (argv: string[]) => strin
   const runs: string[][] = []
   const submitted: string[] = []
   const commands: string[] = []
-  on('process.spawn', async function* () {
-    for (const line of lines) yield { stream: 'stdout' as const, text: line + '\n' }
+  const files = new Map<string, string>()
+  on('process.spawn', async function* (_$, e) {
+    if (!e.argv.includes('card.action.trigger')) {
+      for (const line of lines) yield { stream: 'stdout' as const, text: line + '\n' }
+      return { value: { code: 0, signal: null } }
+    }
+    // The one card listener: answer each card the plugin sends, up to two clicks each.
+    let answered = 0
+    for (let i = 0; i < 200; i++) {
+      const cards = runs.filter(r => r.includes('interactive'))
+      if (answerCard && cards.length > answered) {
+        const rid = /\\?"rid\\?":\\?"([0-9a-f]{16})/.exec(cards[answered]?.join(' ') ?? '')?.[1] ?? ''
+        answered++
+        for (let k = 0; k < 2; k++) {
+          const line = answerCard([rid])
+          if (!line) break
+          yield { stream: 'stdout' as const, text: line + '\n' }
+          await tick()
+        }
+      }
+      await tick()
+    }
     return { value: { code: 0, signal: null } }
   })
   on('process.run', async (_$, e) => {
     const argv = [...e.argv]
-    runs.push(argv)
-    if (argv.includes('card.action.trigger')) {
-      const jq = argv[argv.indexOf('--jq') + 1] ?? ''
-      const rid = /"([0-9a-f]{16})"/.exec(jq)?.[1] ?? ''
-      await until(() => runs.some(r => r.includes('interactive')))
-      await tick() // a real consume waits; never spin
-      return ok(answerCard ? answerCard([rid]) : '')
+    if (argv[0] === 'sh') {
+      const script = argv[2] ?? ''
+      if (script.includes('debug') || script.includes('cat >>')) return ok('')
+      if (script.includes('cat > ')) {
+        files.set(argv[5] ?? '', e.init?.stdin ?? '')
+        return ok('')
+      }
+      if (script.includes('while')) {
+        const file = argv[4] ?? ''
+        for (let i = 0; i < 20 && !files.has(file); i++) await tick()
+        const body = files.get(file) ?? ''
+        files.delete(file)
+        return ok(body)
+      }
+      return ok('')
     }
+    runs.push(argv)
     if (argv.includes('+messages-send')) return ok('{"ok":true,"data":{"message_id":"om_sent1"}}')
     if (argv.includes('GET')) {
       return ok(JSON.stringify({ data: { items: [{ body: { content: JSON.stringify({ image_key: 'img_v3_aaa' }) } }] } }))
@@ -112,6 +141,38 @@ describe('lib', () => {
     expect(localImages('见 /tmp/out/chart.png 和 `/tmp/out/chart.png`')).toEqual(['/tmp/out/chart.png'])
   })
 
+  test('usage reads well: local reset times, countdowns, bars', () => {
+    const now = Date.parse('2026-10-06T15:11:00Z')
+    const text = formatUsage(
+      {
+        version: '2.1.290',
+        cwd: '/Users/me/proj',
+        home: '/Users/me',
+        model: 'claude-opus-5-5',
+        costUsd: 12.04,
+        context: { tokens: 342_500, window: 1_000_000, percent: 34 },
+        rateLimits: [
+          { kind: 'five_hour', percentUsed: 28, resetsAt: '2026-10-06T18:10:00.000Z' },
+          { kind: 'seven_day', percentUsed: 83, resetsAt: '2026-10-10T06:00:00.000Z' },
+        ],
+      },
+      now,
+      480,
+      true,
+    )
+    expect(text).toContain('📁 ~/proj')
+    expect(text).toContain('342.5k / 1M（34%）')
+    expect(text).toContain('5 小时额度：已用 **28%**，2 小时 59 分后重置（10/7 02:10）')
+    expect(text).toContain('7 天额度：已用 **83%** ⚠️，3 天 14 小时后重置（10/10 14:00）')
+    expect(text).toContain('▓▓▓░░░░░░░')
+  })
+
+  test('model ids read as names', () => {
+    expect(prettyModel('claude-opus-5-5')).toBe('Opus 5.5')
+    expect(prettyModel('claude-haiku-4-5-20251001')).toBe('Haiku 4.5')
+    expect(prettyModel('gpt-x')).toBe('gpt-x')
+  })
+
   test('form answers map back to labels', () => {
     const qs = [
       { question: '用哪个库？', multiSelect: false, options: [{ label: 'dayjs' }, { label: 'luxon' }] },
@@ -166,35 +227,53 @@ describe('bridge', () => {
       value: { startedAt: 0, context: { tokens: 42000, window: 200000, percent: 21 }, rateLimits: [], cost: { usd: 1.5 } },
     }))
     await $.command.run(typed('on'))
-    await until(() => h.runs.some(r => r.includes('+messages-reply')))
+    await until(() => h.runs.some(r => r.includes('interactive')))
     expect(h.commands.length).toBe(0)
-    expect(h.runs.find(r => r.includes('+messages-reply'))?.join(' ')).toContain('$1.50')
+    const card = h.runs.find(r => r.includes('interactive'))?.join(' ') ?? ''
+    expect(card).toContain('$1.50')
+    expect(card).toContain('**21%**')
     await $.command.run(typed('off'))
   })
 
-  test('/config is a live card: a click sets the row', async ($, on) => {
+  test('/config sends a card, and a click on any settings card sets the row', async ($, on) => {
     const sets: string[] = []
     let verbose = false
-    const h = harness(on, [event({ content: '/config' })], ([rid]) =>
-      sets.length ? '' : JSON.stringify({ operator_id: 'ou_owner', action_value: JSON.stringify({ rid, kind: 'config', key: 'verbose', set: 'true' }) }),
-    )
+    const runs: string[][] = []
     const engine = { plugin: 'engine', tier: 'core' } as const
+    on('process.spawn', async function* (_$, e) {
+      if (e.argv.includes('card.action.trigger')) {
+        await until(() => runs.some(r => r.includes('interactive')))
+        const value = JSON.stringify({ kind: 'config', view: 'config', key: 'verbose', set: 'true' })
+        yield { stream: 'stdout' as const, text: JSON.stringify({ operator_id: 'ou_owner', message_id: 'om_card1', action_value: value }) + '\n' }
+      } else {
+        yield { stream: 'stdout' as const, text: event({ content: '/config' }) + '\n' }
+      }
+      return { value: { code: 0, signal: null } }
+    })
+    on('process.run', async (_$, e) => {
+      runs.push([...e.argv])
+      return ok(e.argv.includes('+messages-send') ? '{"data":{"message_id":"om_card1"}}' : '{"ok":true}')
+    })
     on('config.list', async () => ({
-      value: [
-        { key: 'verbose', label: 'Verbose output', kind: 'boolean' as const, value: verbose, provider: engine, isLocked: false },
-        { key: 'model', label: 'Model', kind: 'choice' as const, value: 'opus', options: ['opus', 'sonnet'], provider: engine, isLocked: false },
-      ],
+      value: [{ key: 'verbose', label: 'Verbose output', kind: 'boolean' as const, value: verbose, provider: engine, isLocked: false }],
     }))
     on('config.set', async (_$, e) => {
       sets.push(`${e.key}=${String(e.value)}`)
       verbose = e.value === true
       return { value: e.value }
     })
+    on('ui.status', async () => ({ value: undefined }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('ui.toast', async () => ({ value: undefined }))
+    mock.store(on, { allow: ['ou_owner'], homeChat: 'oc_chat1' })
+    mock.clock(on)
     await $.command.run(typed('on'))
-    await until(() => sets.length > 0 && h.runs.some(r => r.includes('PATCH')))
+    await until(() => sets.length > 0 && runs.some(r => r.includes('PATCH')))
     expect(sets).toEqual(['verbose=true'])
-    expect(h.runs.find(r => r.includes('interactive'))?.join(' ')).toContain('Verbose output')
-    expect(h.runs.find(r => r.includes('PATCH'))?.join(' ')).toContain('已把')
+    expect(runs.find(r => r.includes('interactive'))?.join(' ')).toContain('Verbose output')
+    const patch = runs.find(r => r.includes('PATCH'))?.join(' ') ?? ''
+    expect(patch).toContain('om_card1')
+    expect(patch).toContain('已把')
     await $.command.run(typed('off'))
   })
 

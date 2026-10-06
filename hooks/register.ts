@@ -8,6 +8,7 @@ import {
   approvalCard,
   configCard,
   questionCard,
+  statusCard,
   resolvedCard,
   type ApprovalChoice,
   type AskQuestion,
@@ -19,7 +20,12 @@ import {
   chunkReply,
   describeToolInput,
   findResources,
+  formatUsage,
+  LIMIT_NAMES,
+  localTime,
+  tokens,
   isChatId,
+  isMessageId,
   isOpenId,
   localImages,
   markerOf,
@@ -41,9 +47,9 @@ const ALLOW_KEY = 'allow'
 const LAST_KEY = 'lastUnknownSender'
 const HOME_KEY = 'homeChat'
 const DOWNLOADS = '/tmp/feishu-mod'
-/** How long a card waits for a click, polled in short slices so a local answer stops it. */
+/** How long a card waits for a click, in short slices so a local answer stops the wait. */
 const CARD_WAIT_S = 1800
-const CARD_SLICE_S = 60
+const CARD_SLICE_S = 30
 
 const isOn = atom({ plugin: 'feishu-mod', key: 'isOn' } as const, false)
 const status = atom({ plugin: 'feishu-mod', key: 'status' } as const, 'off' as FeishuModStatus)
@@ -53,11 +59,12 @@ const mirrored = atom({ plugin: 'feishu-mod', key: 'mirrored' } as const, [] as 
 const armed = atom({ plugin: 'feishu-mod', key: 'armed' } as const, null as FeishuArmed | null)
 const pending = atom({ plugin: 'feishu-mod', key: 'pending' } as const, {} as Record<string, FeishuPendingCard>)
 const typing = atom({ plugin: 'feishu-mod', key: 'typing' } as const, {} as Record<string, string>)
+const model = atom({ plugin: 'feishu-mod', key: 'model' } as const, '')
 
 type $ = EngineInterface
 
-// The running consumer of this module load; a reload drops it with the module.
-let consumer: AsyncGenerator<unknown, unknown> | undefined
+// The running consumers of this module load; a reload drops them with the module.
+const consumers = new Set<AsyncGenerator<unknown, unknown>>()
 let loopId = 0
 const warnedSenders = new Set<string>()
 
@@ -68,7 +75,16 @@ const STATUS_TEXT: Record<FeishuModStatus, string | undefined> = {
   error: '飞书 ✕ 断开，重连中',
 }
 
-const debug = ($: $, text: string) => $.ui.log(`${PLUGIN}: ${text}`, { to: 'debug' })
+const DEBUG_LOG = `${DOWNLOADS}/debug.log`
+const CLICKS = `${DOWNLOADS}/clicks`
+
+/** To Claude Code's debug log, and to /tmp/feishu-mod/debug.log for when no --debug is on. */
+function debug($: $, text: string): void {
+  $.ui.log(`${PLUGIN}: ${text}`, { to: 'debug' })
+  void $.process.run(['sh', '-c', 'mkdir -p "$1" && cat >> "$2"', 'sh', DOWNLOADS, DEBUG_LOG], {
+    stdin: `${new Date().toISOString()} ${text}\n`,
+  }).catch(() => undefined)
+}
 const rid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16)
 
 async function setStatus($: $, next: FeishuModStatus): Promise<void> {
@@ -170,35 +186,45 @@ async function patchCard($: $, messageId: string, card: Card): Promise<void> {
 }
 
 /**
- * Waits for a click on the card tagged `rid` by an allowed user. The wait is a
- * `$.process.run`, so it costs the calling hook none of its own time budget.
+ * Waits for a click on the card tagged `id` by an allowed user. Feishu lets one
+ * consumer hold card.action.trigger, so the standing listener writes each click
+ * to CLICKS/<id>.json and this waits for that file in a shell `$.process.run`,
+ * which costs the calling hook none of its own time budget.
  */
 async function waitCardAction($: $, id: string, seconds: number): Promise<Record<string, unknown> | null> {
   const deadline = (await $.clock.now()) + seconds * 1000
+  const file = `${CLICKS}/${id}.json`
   for (;;) {
-    // The card was settled at the computer, or the bridge went off: stop listening.
+    // The card was settled at the computer, or the bridge went off: stop waiting.
     if (!(await read($, pending))[id] || !(await read($, isOn))) return null
     const left = Math.floor((deadline - (await $.clock.now())) / 1000)
-    if (left < 5) return null
+    if (left < 2) return null
     const slice = Math.min(left, CARD_SLICE_S)
-    const res = await lark($, [
-      'event', 'consume', 'card.action.trigger', '--as', 'bot', '--max-events', '1', '--timeout', `${slice}s`,
-      '--jq', `select((.action_value | fromjson? | .rid) == "${id}")`,
-    ], { timeoutMs: slice * 1000 + 20_000 }).catch(err => {
+    const res = await $.process.run(
+      ['sh', '-c', 'i=0; while [ "$i" -lt "$2" ]; do if [ -f "$1" ]; then cat "$1"; rm -f "$1"; exit 0; fi; sleep 1; i=$((i+1)); done', 'sh', file, String(slice)],
+      { timeoutMs: slice * 1000 + 15_000 },
+    ).catch(err => {
       debug($, `card wait failed: ${String(err)}`)
       return null
     })
-    // A failing consume would spin: give up and leave the answer to the computer.
-    if (!res || res.exitCode !== 0) {
-      if (res) debug($, `card wait exited ${res.exitCode}: ${res.stderr.slice(0, 300)}`)
-      return null
-    }
-    const line = res.stdout.split('\n').find(l => l.trim().startsWith('{'))
-    const ev = line ? parseObject(line) : null
+    if (!res || res.exitCode !== 0) return null
+    const ev = parseObject(res.stdout.trim())
     if (!ev) continue
     if ((await allowList($)).includes(String(ev.operator_id ?? ''))) return ev
     debug($, `ignored a card click by ${String(ev.operator_id)}`)
   }
+}
+
+/** Every card click arrives here: settings act at once, the rest go to their waiter. */
+async function handleCardClick($: $, ev: Record<string, unknown>): Promise<void> {
+  const value = parseObject(String(ev.action_value ?? '')) ?? {}
+  debug($, `card click kind=${String(value.kind)} by ${String(ev.operator_id)}`)
+  if (value.kind === 'config') return handleConfigClick($, ev)
+  const id = typeof value.rid === 'string' && /^[0-9a-f]{16}$/.test(value.rid) ? value.rid : null
+  if (!id || !(await read($, pending))[id]) return
+  await $.process.run(['sh', '-c', 'mkdir -p "$1" && cat > "$2.tmp" && mv "$2.tmp" "$2"', 'sh', CLICKS, `${CLICKS}/${id}.json`], {
+    stdin: JSON.stringify(ev),
+  })
 }
 
 async function forget($: $, id: string): Promise<FeishuPendingCard | undefined> {
@@ -239,19 +265,38 @@ async function downloadResources($: $, m: FeishuMessage): Promise<string[]> {
 }
 
 /** Commands that open a panel at the computer: answered here from the session's own figures. */
-async function usageText($: $, command: string): Promise<string> {
+/** The machine's offset from UTC in minutes, from `date +%z` (the module's own clock may run in UTC). */
+async function localOffset($: $): Promise<number> {
+  const out = (await $.process.run(['date', '+%z']).catch(() => null))?.stdout.trim() ?? ''
+  const m = /^([+-])(\d{2})(\d{2})$/.exec(out)
+  return m ? (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 0
+}
+
+/** /status, /cost and /usage as a card (text when the card is refused), from the session's own figures. */
+async function sendUsage($: $, m: FeishuMessage, full: boolean): Promise<void> {
   const u = await $.session.usage()
-  const k = (n?: number) => (n === undefined ? '?' : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
-  const lines = [
-    `上下文：${k(u.context.tokens)} / ${k(u.context.window)} tokens${u.context.percent === undefined ? '' : `（${Math.round(u.context.percent)}%）`}`,
-  ]
-  if (command !== 'context') {
-    if (u.cost) lines.unshift(`本会话花费：$${u.cost.usd.toFixed(2)}`)
-    for (const r of u.rateLimits) {
-      lines.push(`${r.kind}：已用 ${Math.round(r.percentUsed)}%${r.resetsAt ? `，${r.resetsAt} 重置` : ''}`)
-    }
-  }
-  return lines.join('\n')
+  const now = await $.clock.now()
+  const offset = await localOffset($)
+  const cwd = full ? await $.session.cwd() : undefined
+  const home = cwd ? /^\/(?:Users|home)\/[^/]+/.exec(cwd)?.[0] : undefined
+  const version = full ? (await $.session.version()).version : undefined
+  const usedModel = (await read($, model)) || undefined
+  const pct = u.context.percent ?? (u.context.tokens !== undefined ? (u.context.tokens / u.context.window) * 100 : undefined)
+  const card = statusCard({
+    title: full && version ? `Claude Code ${version}` : 'Claude Code',
+    costUsd: u.cost?.usd,
+    contextPercent: pct,
+    contextText: `${tokens(u.context.tokens)} / ${tokens(u.context.window)}`,
+    model: usedModel,
+    limits: u.rateLimits.map(r => ({
+      name: LIMIT_NAMES[r.kind] ?? r.kind,
+      percent: r.percentUsed,
+      reset: r.resetsAt ? `${localTime(r.resetsAt, offset)} 重置` : undefined,
+    })),
+    footnote: cwd ? (home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd) : undefined,
+  })
+  if (await sendCard($, m.chatId, card)) return
+  await reply($, m.messageId, formatUsage({ version, cwd, home, model: usedModel, costUsd: u.cost?.usd, context: u.context, rateLimits: u.rateLimits }, now, offset, full))
 }
 
 const USAGE_COMMANDS = new Set(['cost', 'usage', 'context', 'stats'])
@@ -261,58 +306,43 @@ const LOCAL_ONLY = new Set([
   'theme', 'ide', 'rewind', 'tasks', 'bashes', 'export', 'terminal-setup', 'vim', 'keybindings',
   'privacy-settings', 'output-style', 'statusline', 'add-dir', 'install-github-app', 'feedback', 'upgrade',
 ])
-const CONFIG_WAIT_S = 600
 
 async function configRows($: $, command: string): Promise<ConfigRowView[]> {
   const rows = (await $.config.list()).map(r => ({
     key: r.key, label: r.label, kind: r.kind, value: r.value, options: r.options, isLocked: r.isLocked,
   }))
-  if (command === 'model') return rows.filter(r => /model/i.test(r.key))
+  if (command === 'model') return rows.filter(r => r.key === 'model')
   return rows.filter(r => r.kind === 'boolean' || r.kind === 'choice').slice(0, 40)
 }
 
-/** /config and /model as a live card: each click sets the row and redraws the card. */
+const configTitle = (view: string) => (view === 'model' ? '模型' : '设置')
+
+/** /config and /model as a card; its clicks are handled by the standing listener, so it never expires. */
 async function configSession($: $, m: FeishuMessage, command: string): Promise<void> {
-  const title = command === 'model' ? '模型' : '设置'
   const rows = await configRows($, command)
   if (command === 'model' && !rows.length) {
     await reply($, m.messageId, '这里读不到模型设置，请在电脑上用 /model 切换。')
     return
   }
-  const id = rid()
-  await update($, pending, map => ({ ...map, [id]: { cardId: '', tool: `/${command}` } }))
-  const cardId = await sendCard($, m.chatId, configCard(id, title, rows, '点按钮或下拉框，立即生效。'))
-  if (!cardId) return void (await forget($, id))
-  await update($, pending, map => (map[id] ? { ...map, [id]: { cardId, tool: `/${command}` } } : map))
-  for (;;) {
-    const ev = await waitCardAction($, id, CONFIG_WAIT_S)
-    if (!ev) break
-    const value = parseObject(String(ev.action_value ?? '')) ?? {}
-    const key = typeof value.key === 'string' ? value.key : ''
-    const raw = typeof value.set === 'string' ? value.set : String(ev.option ?? '')
-    const row = (await configRows($, command)).find(r => r.key === key)
-    let note = ''
-    if (row && raw) {
-      const next = row.kind === 'boolean' ? raw === 'true' : raw
-      const res = await $.config.set({ key, value: next })
-      note = res.deny ? `没改成：${res.deny}` : `已把 **${row.label}** 设为 ${String(res.value)}`
-      $.ui.toast(`飞书：${note.replace(/\*\*/g, '')}`)
-    }
-    await patchCard($, cardId, configCard(id, title, await configRows($, command), note))
-  }
-  if (await forget($, id)) await patchCard($, cardId, configCard(id, `${title}（已过期，重新发 /${command}）`, []))
+  await sendCard($, m.chatId, configCard(command, configTitle(command), rows, '点按钮或下拉框，立即生效。'))
 }
 
-async function statusText($: $): Promise<string> {
-  const v = await $.session.version()
-  const cwd = await $.session.cwd()
-  const model = (await $.config.list()).find(r => /model/i.test(r.key))
-  return [
-    `Claude Code ${v.version}`,
-    `目录：${cwd}`,
-    model ? `模型：${String(model.value)}` : '',
-    await usageText($, 'cost'),
-  ].filter(Boolean).join('\n')
+/** One click on any settings card: set the row, then redraw that card. */
+async function handleConfigClick($: $, ev: Record<string, unknown>): Promise<void> {
+  if (!(await allowList($)).includes(String(ev.operator_id ?? ''))) return
+  const value = parseObject(String(ev.action_value ?? '')) ?? {}
+  const view = value.view === 'model' ? 'model' : 'config'
+  const key = typeof value.key === 'string' ? value.key : ''
+  const raw = typeof value.set === 'string' ? value.set : String(ev.option ?? '')
+  const row = (await configRows($, view)).find(r => r.key === key)
+  let note = ''
+  if (row && raw) {
+    const res = await $.config.set({ key, value: row.kind === 'boolean' ? raw === 'true' : raw })
+    note = res.deny ? `没改成：${res.deny}` : `已把 **${row.label}** 设为 ${String(res.value)}`
+    $.ui.toast(`飞书：${note.replace(/\*\*/g, '')}`)
+  }
+  const cardId = String(ev.message_id ?? '')
+  if (isMessageId(cardId)) await patchCard($, cardId, configCard(view, configTitle(view), await configRows($, view), note))
 }
 
 async function helpText($: $): Promise<string> {
@@ -327,11 +357,11 @@ async function runSlash($: $, m: FeishuMessage, command: string, args: string): 
     return
   }
   if (USAGE_COMMANDS.has(command)) {
-    await reply($, m.messageId, await usageText($, command))
+    await sendUsage($, m, false)
     return
   }
   if (command === 'config' || command === 'model') return configSession($, m, command)
-  if (command === 'status') return void (await reply($, m.messageId, await statusText($)))
+  if (command === 'status') return sendUsage($, m, true)
   if (command === 'help') return void (await reply($, m.messageId, await helpText($)))
   if (LOCAL_ONLY.has(command)) {
     await reply($, m.messageId, `/${command} 是电脑上的交互界面，需要在电脑上操作。`)
@@ -396,45 +426,64 @@ async function handle($: $, m: FeishuMessage): Promise<void> {
   await $.prompt.submit({ text: buildPrompt(m, files), asUser: true })
 }
 
-async function runConsumer($: $): Promise<void> {
-  const id = ++loopId
+/** Keeps one `lark-cli event consume` running while the bridge is on, line by line. */
+async function runStream(
+  $: $,
+  id: number,
+  args: string[],
+  onLine: (line: string) => Promise<void>,
+  isPrimary: boolean,
+): Promise<void> {
   while (id === loopId && (await read($, isOn))) {
-    await setStatus($, 'starting')
+    if (isPrimary) await setStatus($, 'starting')
     let buffer = ''
     try {
       // An unbounded consume exits when stdin closes; a timeout makes it ignore that.
-      const stream = $.process.spawn({
-        argv: [LARK, '--profile', PROFILE, 'event', 'consume', 'im.message.receive_v1', '--as', 'bot', '--timeout', '720h'],
-      })
-      consumer = stream
-      for await (const chunk of stream) {
-        if (id !== loopId) break
-        if ((await read($, status)) !== 'listening') await setStatus($, 'listening')
-        if (chunk.stream === 'stderr') {
-          debug($, chunk.text.trim())
-          continue
+      const stream = $.process.spawn({ argv: [LARK, '--profile', PROFILE, 'event', 'consume', ...args, '--as', 'bot', '--timeout', '720h'] })
+      consumers.add(stream)
+      try {
+        for await (const chunk of stream) {
+          if (id !== loopId) break
+          if (isPrimary && (await read($, status)) !== 'listening') await setStatus($, 'listening')
+          if (chunk.stream === 'stderr') {
+            debug($, chunk.text.trim())
+            continue
+          }
+          const { lines, rest } = splitLines(buffer, chunk.text)
+          buffer = rest
+          for (const line of lines) await onLine(line).catch(err => debug($, String(err)))
         }
-        const { lines, rest } = splitLines(buffer, chunk.text)
-        buffer = rest
-        for (const line of lines) {
-          const message = parseEvent(line)
-          if (message) await handle($, message).catch(err => debug($, String(err)))
-        }
+      } finally {
+        consumers.delete(stream)
       }
     } catch (err) {
-      debug($, `consumer failed: ${String(err)}`)
+      debug($, `consumer ${args[0]} failed: ${String(err)}`)
     }
     if (id !== loopId || !(await read($, isOn))) break
-    await setStatus($, 'error')
+    if (isPrimary) await setStatus($, 'error')
     await $.clock.sleep(5000)
   }
 }
 
+async function runConsumer($: $): Promise<void> {
+  const id = ++loopId
+  await Promise.all([
+    runStream($, id, ['im.message.receive_v1'], async line => {
+      const message = parseEvent(line)
+      if (message) await handle($, message)
+    }, true),
+    runStream($, id, ['card.action.trigger'], async line => {
+      const ev = parseObject(line)
+      if (ev) await handleCardClick($, ev)
+    }, false),
+  ])
+}
+
 async function stopConsumer($: $): Promise<void> {
   loopId++
-  const running = consumer
-  consumer = undefined
-  await running?.return(undefined).catch(() => undefined)
+  const running = [...consumers]
+  consumers.clear()
+  await Promise.all(running.map(s => s.return(undefined).catch(() => undefined)))
   await setStatus($, 'off')
 }
 
@@ -538,6 +587,8 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId) return result
+    const used = e.usage?.model
+    if (used) await update($, model, () => used)
     const messageId = (await read($, turns))[e.turnId]
     if (!messageId) return result
     await update($, turns, map => {
