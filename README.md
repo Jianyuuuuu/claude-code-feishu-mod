@@ -58,6 +58,18 @@ Answer `y` to `Add marketplace?`, then pick a scope (user is the default).
 
 First run: `/feishu on`, send the bot a direct message, run `/feishu allow last`, then message it again. Your last direct chat with the bot becomes the chat that cards and mirrored prompts go to.
 
+To keep the allow list across reinstalls and new sessions, set it in `~/.claude/settings.json` (or `/config`):
+
+```json
+"pluginConfigs": {
+  "feishu-mod@jianyuuuuu": {
+    "options": { "allowedUsers": "ou_xxx,ou_yyy", "homeChat": "oc_xxx" }
+  }
+}
+```
+
+`allowedUsers` adds to the users allowed with `/feishu allow`; `homeChat` is used until a direct message sets the chat.
+
 ## How it works
 
 - `lark-cli … event consume im.message.receive_v1` runs in the background and streams NDJSON events. If it exits, it reconnects after 5 seconds.

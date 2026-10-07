@@ -92,14 +92,19 @@ async function setStatus($: $, next: FeishuModStatus): Promise<void> {
   $.ui.status(STATUS_TEXT[next])
 }
 
+/** Users and chat from settings (`pluginConfigs`), which outlive the store when the plugin is reinstalled. */
+let configAllow: string[] = []
+let configHome: string | null = null
+
 async function allowList($: $): Promise<string[]> {
   const value = await $.store.get(ALLOW_KEY)
-  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+  const stored = Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+  return [...new Set([...configAllow, ...stored])]
 }
 
 async function homeChat($: $): Promise<string | null> {
   const value = await $.store.get(HOME_KEY)
-  return typeof value === 'string' && isChatId(value) ? value : null
+  return typeof value === 'string' && isChatId(value) ? value : configHome
 }
 
 /** The bridge routes to Feishu only while it is on and knows where to send. */
@@ -513,6 +518,8 @@ async function feishuCommand($: $, argText: string): Promise<string> {
       const list = await allowList($)
       const nextList = verb === 'allow' ? [...new Set([...list, target])] : list.filter(x => x !== target)
       await $.store.set(ALLOW_KEY, nextList)
+      if (verb === 'deny' && configAllow.includes(target))
+        return `${target} 写在设置的 allowedUsers 里，仍然有效；要移除请改 settings.json 的 pluginConfigs。`
       return `${verb === 'allow' ? '已授权' : '已移除'} ${target}。当前授权：${nextList.join(', ') || '无'}`
     }
     default:
@@ -528,7 +535,13 @@ async function feishuCommand($: $, argText: string): Promise<string> {
 
 // ── hooks ───────────────────────────────────────────────────────────────────
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  configAllow = String(options.allowedUsers ?? '')
+    .split(',')
+    .map(v => v.trim())
+    .filter(isOpenId)
+  const home = String(options.homeChat ?? '').trim()
+  configHome = isChatId(home) ? home : null
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'feishu',

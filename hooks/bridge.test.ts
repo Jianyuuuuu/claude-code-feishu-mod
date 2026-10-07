@@ -356,6 +356,14 @@ describe('bridge', () => {
     await $.command.run(typed('off'))
   })
 
+  test('users and chat from settings are allowed with an empty store', { options: { allowedUsers: 'ou_owner, bad', homeChat: 'oc_chat1' } }, async ($, on) => {
+    on('ui.status', async () => ({ value: undefined }))
+    mock.store(on, {})
+    const res = await $.command.run(typed('status'))
+    expect(res.text).toContain('授权用户：ou_owner\n')
+    expect(res.text).toContain('飞书会话：oc_chat1')
+  })
+
   test('without the bridge on, permission asks stay local', async ($, on) => {
     const h = harness(on, [])
     on('classic.PermissionRequest', async () => ({}))
