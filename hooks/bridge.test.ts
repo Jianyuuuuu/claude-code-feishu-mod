@@ -203,6 +203,25 @@ describe('bridge', () => {
     await $.command.run(typed('off'))
   })
 
+  test('text written between tool calls is replied with the final answer', async ($, on) => {
+    const h = harness(on, [event()])
+    const steps = ['先查一下磁盘。', '', '再看看大文件。']
+    on('turn.step', async function* (_$, e) {
+      return { turnId: e.turnId, index: e.index, answer: steps[e.index] ?? '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
+    })
+    await $.command.run(typed('on'))
+    await until(() => h.submitted.length > 0)
+
+    await $.turn.start({ text: h.submitted[0] ?? '', turnId: 't1' })
+    for (const index of [0, 1, 2]) {
+      for await (const _ of $.turn.step({ turnId: 't1', index, model: 'm', messageCount: 1 })) void _
+    }
+    await $.turn.complete(complete('t1', '磁盘还剩 120G。'))
+    const replyCall = h.runs.find(argv => argv.includes('+messages-reply'))
+    expect(replyCall).toContain('先查一下磁盘。\n\n再看看大文件。\n\n磁盘还剩 120G。')
+    await $.command.run(typed('off'))
+  })
+
   test('an image is downloaded and its path handed to the session', async ($, on) => {
     const h = harness(on, [event({ message_type: 'image', content: '[Image: img_v3_aaa]' })])
     await $.command.run(typed('on'))

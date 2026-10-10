@@ -17,6 +17,8 @@ declare module 'claude-code' {
       status: FeishuModStatus
       /** turnId -> the Feishu message_id the turn's answer replies to. */
       turns: Record<string, string>
+      /** turnId -> the visible text of each step so far, for a turn bound to Feishu. */
+      said: Record<string, string[]>
       /** Recently handled message_ids, newest last. */
       seen: string[]
       mirrored: FeishuMirrored[]

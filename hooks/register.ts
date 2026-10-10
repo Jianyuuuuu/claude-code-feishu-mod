@@ -54,6 +54,7 @@ const CARD_SLICE_S = 30
 const isOn = atom({ plugin: 'feishu-mod', key: 'isOn' } as const, false)
 const status = atom({ plugin: 'feishu-mod', key: 'status' } as const, 'off' as FeishuModStatus)
 const turns = atom({ plugin: 'feishu-mod', key: 'turns' } as const, {} as Record<string, string>)
+const said = atom({ plugin: 'feishu-mod', key: 'said' } as const, {} as Record<string, string[]>)
 const seen = atom({ plugin: 'feishu-mod', key: 'seen' } as const, [] as string[])
 const mirrored = atom({ plugin: 'feishu-mod', key: 'mirrored' } as const, [] as FeishuMirrored[])
 const armed = atom({ plugin: 'feishu-mod', key: 'armed' } as const, null as FeishuArmed | null)
@@ -597,6 +598,17 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // turn.complete's answer is only the last message; the text written between
+  // tool calls is collected here, step by step, so Feishu gets all of it.
+  on('turn.step', async function* ($, e, next) {
+    const result = yield* next(e)
+    const text = result.answer.trim()
+    if (e.agentId || !text) return result
+    if (!(await read($, turns))[e.turnId]) return result
+    await update($, said, map => ({ ...map, [e.turnId]: [...(map[e.turnId] ?? []), text] }))
+    return result
+  })
+
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId) return result
@@ -604,19 +616,28 @@ export const register: Register = (on, options) => {
     if (used) await update($, model, () => used)
     const messageId = (await read($, turns))[e.turnId]
     if (!messageId) return result
+    const parts = [...((await read($, said))[e.turnId] ?? [])]
     await update($, turns, map => {
       const { [e.turnId]: _, ...rest } = map
       return rest
     })
+    await update($, said, map => {
+      const { [e.turnId]: _, ...rest } = map
+      return rest
+    })
 
-    const text =
-      e.reason === 'answer' ? e.answer.trim() || '（本轮没有文字回答）'
+    const final = e.answer.trim()
+    if (final && parts[parts.length - 1] !== final) parts.push(final)
+    const body = parts.join('\n\n')
+    const note =
+      e.reason === 'answer' ? ''
       : e.reason === 'aborted' ? '（这一轮在电脑上被中断了）'
       : e.reason === 'refusal' ? '（这一轮被模型拒绝了）'
       : '（这一轮因 API 错误中断）'
+    const text = [body, note].filter(Boolean).join('\n\n') || '（本轮没有文字回答）'
     const ok = await reply($, messageId, text)
     if (e.reason === 'answer') {
-      for (const path of localImages(e.answer)) {
+      for (const path of localImages(body)) {
         const st = await $.fs.stat(path).catch(() => null)
         if (st) await replyImage($, messageId, path)
       }
