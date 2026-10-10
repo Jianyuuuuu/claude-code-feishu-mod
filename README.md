@@ -78,6 +78,13 @@ To keep the allow list across reinstalls and new sessions, set it in `~/.claude/
 - Approvals and questions use the `classic.PermissionRequest` hook, which runs while the local dialog is open. The hook sends a card and waits for a matching `card.action.trigger` in 60-second slices. The answer comes back as the hook's decision (`updatedPermissions` with `destination: session` for "don't ask again", or `updatedInput.answers` for questions). If the call is settled at the computer first, a `tool.call` hook marks the card as handled there.
 - Only clicks from allowed users count. No message is handled while the allow list is empty. The bridge is off by default in every session, so several open sessions don't all answer the same message.
 
+## What it runs and sends
+
+- **Runs** `lark-cli` (installed by you, with the `claude-code` profile) as a child process: one long-lived `event consume` listener, plus one call per reply, reaction, card or download. It also runs `sh`, `mkdir`, `ls` and `date` locally, for the files below and the time zone.
+- **Sends** to your own Feishu / Lark app, through lark-cli only: the answers of turns started from Feishu, prompts typed at the computer while the bridge is on (mirrored), images an answer names by local path, and the tool name and input summary shown on permission and question cards. Nothing is sent anywhere else, and nothing is sent while the bridge is off.
+- **Writes** downloaded images and files to `/tmp/feishu-mod/<message_id>/`, a debug log to `/tmp/feishu-mod/debug.log`, and card clicks to `/tmp/feishu-mod/clicks`.
+- **Stores** the allow list and the last chat with the bot in the plugin's store in Claude Code; no credentials are kept by the mod (lark-cli holds the app's).
+
 ## Limitations
 
 - The Claude Code session must stay open; replies come from that session.
